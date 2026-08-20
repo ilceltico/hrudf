@@ -63,7 +63,7 @@ To run our algorithm on your own neural UDFs, in practice, you only need to do f
     pseudo_sdfs = compute_pseudo_sdf(
         model, 
         recursion_type=config['recursion_type'], 
-        lambda query_points: your_neural_udf_function(query_points),
+        udf_and_grad_f=lambda query_points: your_neural_udf_function(query_points),
         n_grid_samples=resolution, 
         num_recursions=5, # We suggest 5 for noisy networks, and 2-3 for more precise ones
         batch_size=10000,
