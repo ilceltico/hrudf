@@ -1,0 +1,383 @@
+import os
+import time
+import torch
+import numpy as np
+import trimesh
+from trimesh.transformations import scale_matrix
+import core.utils as utils
+import igl
+
+
+POWERS_OF_2 = utils.POWERS_OF_2
+
+class GridDataset(torch.utils.data.Dataset):
+    def __init__(self, 
+                 base_dir, 
+                 split_file, 
+                 grid_points, 
+                 split = "train",  
+                 get_sdf = True, 
+                 ):
+        self.base_dir = base_dir
+        self.split_file = split_file
+        self.grid_points = grid_points
+        self.get_sdf = get_sdf
+
+        lines = []
+        with open(self.split_file, 'r') as f:
+            lines = f.readlines()
+        
+        #Keep only the training part (as in Neural Dual Contouring, we keep the first 80%)
+        if split == "train":
+            lines = lines[:int(len(lines)*0.8)]
+        elif split == "val":
+            lines = lines[int(len(lines)*0.8):]
+        else:
+            lines = lines
+
+        #Generate the file list. We assume there is only one obj file per subfolder
+        self.file_list = []
+        for line in lines:
+            dir = os.path.join(self.base_dir, line.strip())
+            #If it's a ply or obj file, add it to the list
+            if dir.endswith(".obj") or dir.endswith(".ply"):
+                self.file_list.append(dir)
+            else:
+                files = os.listdir(dir)
+                files = [file for file in files if not file.startswith(".") and (file.endswith(".obj") or file.endswith(".ply"))]
+                if len(files) == 0:
+                    return Exception(f"No obj files found in directory {dir}")
+                if len(files) > 1:
+                    return Exception(f"Multiple obj files found in directory {dir}")
+            
+                self.file_list.append(os.path.join(dir, files[0]))
+        
+    def __len__(self):
+        return len(self.file_list)
+    
+    def __getitem__(self, idx):
+        mesh = trimesh.load_mesh(self.file_list[idx])
+
+        query_points = np.zeros((self.grid_points ** 3,3))
+        query_range = np.linspace(-1,1,self.grid_points)
+        x_coords, y_coords, z_coords = np.meshgrid(query_range,query_range,query_range, indexing="ij") #"ij" indexing is important
+
+        query_points[:,0] = x_coords.reshape(-1)
+        query_points[:,1] = y_coords.reshape(-1)
+        query_points[:,2] = z_coords.reshape(-1)
+
+        if isinstance(mesh, trimesh.Scene):
+            if len(mesh.geometry) == 0:
+                mesh = None  # empty scene
+            else:
+                # we lose texture information here
+                mesh = trimesh.util.concatenate(
+                    tuple(trimesh.Trimesh(vertices=g.vertices, faces=g.faces)
+                        for g in mesh.geometry.values()))
+                
+        mesh.apply_translation(-mesh.bounds.mean(axis=0))
+
+        scale = scale_matrix(1.99999 / max(mesh.extents)) #Keeping 2.0 causes some faces to be exactly on the grid, which are potentially problematic
+        mesh.apply_transform(scale)
+
+        if self.get_sdf:
+            sdf, _, closest_points, _ = igl.signed_distance(query_points, mesh.vertices, mesh.faces)
+        else:
+            # This is actually an unisgned distance
+            sdf, _, closest_points = igl.point_mesh_squared_distance(query_points, mesh.vertices, mesh.faces)
+            sdf = np.sqrt(sdf)
+
+        sdf = torch.Tensor(sdf)
+
+        grads = query_points - closest_points
+        grads = torch.Tensor(grads)
+        grads = grads / torch.linalg.norm(grads, axis=1).reshape(-1,1)
+
+        sdf = sdf.reshape(self.grid_points, self.grid_points, self.grid_points)
+
+        grads = grads.reshape(self.grid_points, self.grid_points, self.grid_points, -1)
+
+        # Some query points are exactly on the surface and produce NaN gradients
+        # The correct SDF gradient would be the surface normal on that point, but here we assume to use UDF gradients for now
+        grads = torch.nan_to_num(grads, nan=0.0)
+
+        return sdf, grads, idx
+
+
+class PrecomputedGridDataset(torch.utils.data.Dataset):
+    def __init__(self, 
+                 base_dirs, 
+                 noise_udf = 0.0, 
+                 noise_udf_type = "add", 
+                 noise_grad = 0.0, 
+                 noise_grad_type = "add", 
+                 noise_grad_swap=None, 
+                 max_avg_distance = None, 
+                 max_max_distance = None, 
+                 class_balanced_weights = False, 
+                 compute_gt = False, 
+                 noise_model = "cell-independent",
+                 ):
+        
+        self.base_dirs = base_dirs
+
+        # List the toch files in the directory
+        self.file_list = []
+        for base_dir in self.base_dirs:
+            base_dir_list = os.listdir(base_dir)
+            #Sort it numerically
+            base_dir_list = sorted(base_dir_list, key=lambda x: int(x.split(".")[0]))
+            for file in base_dir_list:
+                if file.endswith(".pt"):
+                    self.file_list.append(os.path.join(base_dir, file))
+
+        self.noise_udf = noise_udf
+        self.noise_udf_type = noise_udf_type
+        self.noise_grad = noise_grad
+        self.noise_grad_type = noise_grad_type
+        self.noise_grad_swap = noise_grad_swap
+
+        self.max_avg_distance = max_avg_distance
+        self.max_max_distance = max_max_distance
+        self.class_balanced_weights = class_balanced_weights
+        self.compute_gt = compute_gt
+
+        self.noise_model = noise_model
+        
+        
+    def __len__(self):
+        return len(self.file_list)
+    
+    def preprocess(self, sdf, grads, inject_noise=False):
+        class_weights = torch.ones((128))
+        length = (self.grid_points - 1) * (self.grid_points - 1) * (self.grid_points - 1)
+        shape = (self.grid_points - 1, self.grid_points - 1, self.grid_points - 1)
+
+
+        z_indices, y_indices, x_indices = np.unravel_index(np.arange(length), shape)
+
+        # Inject gradient noise
+        if inject_noise and self.noise_grad != 0.0:
+            if self.noise_grad_type == "add":
+                grads = grads + self.noise_grad * torch.randn_like(grads)
+            elif self.noise_grad_type == "scale":
+                grads = grads * (1 + self.noise_grad * torch.randn_like(grads))
+            elif self.noise_grad_type == "add_exp":
+                scale = torch.exp(-(grads.detach() / self.noise_grad)**2) * self.noise_grad
+                noise = torch.randn(grads.shape) * scale
+                grads = grads + noise
+            elif self.noise_grad_type == "scale_exp":
+                scale = torch.exp(-(grads.detach() / self.noise_grad)**2)
+                noise = torch.randn(grads.shape) * scale
+                grads = grads * (1+ noise)
+            else:
+                raise Exception("Unknown noise type for gradients")
+            
+            # Gradient swapping (randomly swap gradient direction, higher chance for low UDF values)
+            grad_swap = self.noise_grad_swap
+            if grad_swap is not None and grad_swap > 0.:
+                prob = 0.5 * torch.exp(-(grads.detach() / grad_swap)**2)
+                swap = torch.rand(grads.shape) < prob
+                swap = 1 - 2 * swap  # from proba to sign
+                swap = swap.repeat_interleave(3).reshape(grads.shape)
+                grads = grads * swap
+
+        sdf_values = torch.zeros((8, length))
+        grad_values = torch.zeros((8, length, 3))
+        
+        sdf_values[0] = sdf[z_indices, y_indices, x_indices]
+        sdf_values[1] = sdf[z_indices, y_indices, x_indices + 1]
+        sdf_values[2] = sdf[z_indices, y_indices + 1, x_indices + 1]
+        sdf_values[3] = sdf[z_indices, y_indices + 1, x_indices]
+        sdf_values[4] = sdf[z_indices + 1, y_indices, x_indices]
+        sdf_values[5] = sdf[z_indices + 1, y_indices, x_indices + 1]
+        sdf_values[6] = sdf[z_indices + 1, y_indices + 1, x_indices + 1]
+        sdf_values[7] = sdf[z_indices + 1, y_indices + 1, x_indices]
+
+        grad_values[0] = grads[z_indices, y_indices, x_indices]
+        grad_values[1] = grads[z_indices, y_indices, x_indices + 1]
+        grad_values[2] = grads[z_indices, y_indices + 1, x_indices + 1]
+        grad_values[3] = grads[z_indices, y_indices + 1, x_indices]
+        grad_values[4] = grads[z_indices + 1, y_indices, x_indices]
+        grad_values[5] = grads[z_indices + 1, y_indices, x_indices + 1]
+        grad_values[6] = grads[z_indices + 1, y_indices + 1, x_indices + 1]
+        grad_values[7] = grads[z_indices + 1, y_indices + 1, x_indices]
+
+        if inject_noise and self.noise_udf != 0.0:
+            # Inject the noise to a copy of the input, and process it the same way as the original input. This will be our noisy udf
+            noisy_udf = sdf.clone()
+            noisy_udf = abs(noisy_udf)
+
+            # Gaussian noise on the input
+            if (self.noise_udf != 0.0):
+                if self.noise_udf_type == "add":
+                    noise = torch.randn(noisy_udf.shape)*self.noise_udf
+                    noisy_udf = noisy_udf + noise
+                elif self.noise_udf_type == "scale":
+                    noise = torch.randn(noisy_udf.shape)*self.noise_udf
+                    noisy_udf = noisy_udf * (1+ noise)
+                elif self.noise_udf_type == "scale_all":
+                    noise = torch.randn([1])
+                    noisy_udf = noisy_udf * (1+ noise)
+                elif self.noise_udf_type == "add_exp":
+                    scale = torch.exp(-(noisy_udf.detach() / self.noise_udf)**2) * self.noise_udf
+                    noise = torch.randn(noisy_udf.shape) * scale
+                    noisy_udf = noisy_udf + noise.abs()
+                elif self.noise_udf_type == "scale_exp":
+                    scale = torch.exp(-(noisy_udf.detach() / self.noise_udf)**2)
+                    noise = torch.randn(noisy_udf.shape) * scale
+                    noisy_udf = noisy_udf * (1+ noise).abs()
+                else:
+                    raise Exception("Unknown noise type")
+                
+            # Compute the udf_values for the noisy udf
+            if not self.include_neighbors:
+                udf_values = torch.zeros((8, length))
+            else:
+                udf_values = torch.zeros((64, length))
+
+                noisy_udf2 = torch.zeros((noisy_udf.shape[0]+2, noisy_udf.shape[1]+2, noisy_udf.shape[2]+2))
+                noisy_udf2[1:-1,1:-1,1:-1] = noisy_udf
+                noisy_udf = noisy_udf2
+
+            udf_values[0] = noisy_udf[z_indices, y_indices, x_indices]                  
+            udf_values[1] = noisy_udf[z_indices, y_indices, x_indices + 1]
+            udf_values[2] = noisy_udf[z_indices, y_indices + 1, x_indices + 1]
+            udf_values[3] = noisy_udf[z_indices, y_indices + 1, x_indices]
+            udf_values[4] = noisy_udf[z_indices + 1, y_indices, x_indices]
+            udf_values[5] = noisy_udf[z_indices + 1, y_indices, x_indices + 1]
+            udf_values[6] = noisy_udf[z_indices + 1, y_indices + 1, x_indices + 1]
+            udf_values[7] = noisy_udf[z_indices + 1, y_indices + 1, x_indices]     
+
+        else:
+            udf_values = torch.abs(sdf_values)
+        
+        if ((self.max_avg_distance is not None and self.max_max_distance is not None)):
+            within_thresholds = ((self.max_avg_distance is not None and self.max_max_distance is not None) and
+                                (torch.abs(sdf_values[:8]).mean(dim=0) <= self.max_avg_distance) &
+                                (torch.abs(sdf_values[:8]).max(dim=0).values <= self.max_max_distance))
+        else:
+            within_thresholds = torch.ones(length, dtype=torch.bool)
+            
+        # Extract indices at which within_thresholds is True
+        indices = torch.nonzero(within_thresholds).squeeze(1).int()
+
+        if self.compute_gt or self.class_balanced_weights:
+            reference_sdf_values = sdf_values[:8, within_thresholds] * torch.sign(sdf_values[0, within_thresholds])
+            reference_sdf_values[reference_sdf_values < 0] = 0
+            reference_sdf_values[reference_sdf_values > 0] = 1
+            gt_one_hot_numbers = reference_sdf_values[1:,:].transpose(1,0).matmul(POWERS_OF_2.float()).int()
+
+        if self.class_balanced_weights:
+            #Count the different classes in gt_one_hot_numbers
+            class_weights = torch.bincount(gt_one_hot_numbers, minlength=128)
+            class_weights = 1. / class_weights
+            class_weights[torch.isinf(class_weights)] = 0
+
+        # Creates the input tensor for the network
+        inputs = torch.hstack((udf_values.permute(1,0), grad_values.permute(1,0,2).reshape(length,-1)))
+
+        if self.compute_gt:
+            # Compute the ground truth sign configurations
+            # Assume that the first corner is the reference corner and is positive
+            base_sign = torch.sign(sdf_values[0,:])
+            # I consider 0 to be positive
+            base_sign[base_sign == 0] = 1
+            # If the reference corner is negative, flip the sign of all corners
+            reference_sdf_values = sdf_values[:8,:] * base_sign
+            reference_sdf_values[reference_sdf_values >= 0] = 1
+            reference_sdf_values[reference_sdf_values < 0] = 0
+            # Compute the one-hot configuration of the ground truth. The reference corner is not considered because it is assumed positive.
+            gt_one_hot_numbers = reference_sdf_values[1:,:] * POWERS_OF_2.view(-1,1)
+            gt_one_hot_numbers = gt_one_hot_numbers.sum(axis=0).int() # A list of numbers between 0 and 127, one for each cell
+            # Now we produce the one-hot encoding of the ground truth
+            gt = torch.zeros((2**7, length))
+            gt[gt_one_hot_numbers, torch.arange(length)] = 1
+        else:
+            gt = torch.Tensor(0)
+
+        # Filter the inputs and ground truth based on the indices
+        inputs = inputs[indices]
+        if self.compute_gt:
+            gt = gt[:, indices]
+            gt = gt.permute(1,0)
+
+        return inputs, gt, indices, class_weights
+
+    
+    def __getitem__(self, idx):
+
+        # Consistent noise model between cells.
+        if self.noise_model == "cell-consistency":
+            sdf, grads, shape = torch.load(self.file_list[idx])
+            self.grid_points = shape[0] + 1
+            input, gt, indices, class_weights = self.preprocess(sdf, grads, inject_noise=True)
+
+
+        # Applies the noise to the input in a cell-wise manner. No noise consistency between cells.
+        elif self.noise_model == "cell-independent":
+
+            sdf, grads, shape = torch.load(self.file_list[idx], weights_only=False)
+            self.grid_points = shape[0] + 1
+            # start = time.time()
+            input, gt, indices, class_weights = self.preprocess(sdf, grads, inject_noise=False)
+            # print(f"Preprocessing time: {time.time() - start} seconds")
+        
+            gradient_start = 8
+            # There is neighboring information
+            if input.shape[1] > 32:
+                gradient_start = 64
+
+            # Gaussian noise on the input
+            if (self.noise_udf != 0.0):
+                if self.noise_udf_type == "add":
+                    noise = torch.randn(input[:,:gradient_start].shape)*self.noise_udf
+                    input[:,:gradient_start] = input[:,:gradient_start] + noise
+                elif self.noise_udf_type == "scale":
+                    noise = torch.randn(input[:,:gradient_start].shape)*self.noise_udf
+                    input[:,:gradient_start] = input[:,:gradient_start] * (1+ noise)
+                elif self.noise_udf_type == "scale_all":
+                    noise = torch.randn([1])
+                    input[:,:gradient_start] = input[:,:gradient_start] * (1+ noise)
+                elif self.noise_udf_type == "add_exp":
+                    scale = torch.exp(-(input[:,:gradient_start].detach() / self.noise_udf)**2) * self.noise_udf
+                    noise = torch.randn(input[:,:gradient_start].shape) * scale
+                    input[:,:gradient_start] = input[:,:gradient_start] + noise.abs()
+                elif self.noise_udf_type == "scale_exp":
+                    scale = torch.exp(-(input[:,:gradient_start].detach() / self.noise_udf)**2)
+                    noise = torch.randn(input[:,:gradient_start].shape) * scale
+                    input[:,:gradient_start] = input[:,:gradient_start] * (1+ noise).abs()
+                else:
+                    raise Exception("Unknown noise type")
+            
+            # Gaussian noise on the gradients
+            if (self.noise_grad != 0.0):
+                noise = torch.randn(input[:,gradient_start:].shape)*self.noise_grad
+                if self.noise_grad_type == "add":
+                    input[:,gradient_start:] = input[:,gradient_start:] + noise
+                elif self.noise_grad_type == "scale":
+                    input[:,gradient_start:] = input[:,gradient_start:] * (1+ noise)
+                elif self.noise_grad_type == "add_exp":
+                    scale = torch.exp(-(input[:,gradient_start:].detach() / self.noise_grad)**2) * self.noise_grad
+                    noise = torch.randn(input[:,gradient_start:].shape) * scale
+                    input[:,gradient_start:] = input[:,gradient_start:] + noise
+                elif self.noise_grad_type == "scale_exp":
+                    scale = torch.exp(-(input[:,gradient_start:].detach() / self.noise_grad)**2)
+                    noise = torch.randn(input[:,gradient_start:].shape) * scale
+                    input[:,gradient_start:] = input[:,gradient_start:] * (1+ noise)
+                else:
+                    raise Exception("Unknown noise type")
+            
+            # Gradient swapping (randomly swap gradient direction, higher chance for low UDF values)
+            grad_swap = self.noise_grad_swap
+            if grad_swap is not None and grad_swap > 0.:
+                prob = 0.5 * torch.exp(-(input[:,:gradient_start].detach() / grad_swap)**2)
+                swap = torch.rand(input[:,:gradient_start].shape) < prob
+                swap = 1 - 2 * swap  # from proba to sign
+                swap = swap.repeat_interleave(3).reshape(input[:,gradient_start:].shape)
+                input[:,gradient_start:] = input[:,gradient_start:] * swap
+
+        else:
+            raise Exception("Unknown noise model")
+                
+        return input, gt, indices, class_weights, shape, idx
