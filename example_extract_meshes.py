@@ -121,27 +121,8 @@ def main():
                 # dmudf_mesh.export(str(current_recursion_dir / f"{mesh_name}_original_dmudf.ply"))
 
 
-
 # Define a function that extracts UDF and gradients and returns them as Torch Tensors. 
-# def udf_and_grad_f(query_points, mesh):
-#     udf, facet_indices, closest_points = igl.point_mesh_squared_distance(query_points.cpu().detach().numpy(), mesh.vertices, mesh.faces) #This function computes the squared distance, so we need to take the square root
-#     udf = np.sqrt(udf)
-#     udf = torch.Tensor(udf)
-
-#     # IMPORTANT: the gradients point away from the surface.
-#     udf_grads = query_points - closest_points
-#     udf_grads = torch.Tensor(udf_grads)
-#     udf_grads_normalized = utils.normalize(udf_grads, dim=1)
-
-#     # Some query points are exactly on the surface and can produce NaN gradients
-#     # The UDF gradient does not exist on the surface, so here we set it to zero.
-#     udf_grads_normalized = torch.nan_to_num(udf_grads_normalized, nan=0.0)
-
-#     return udf, udf_grads_normalized
-
-
 # Here is an example of the above function, but for neural UDFs (udf_autodecoder in this example)
-# For speed purposes, batching is IMPORTANT.
 def udf_and_grad_f_deepsdf(udf_autodecoder, latent, clamp_distance, query_points):
     udf_autodecoder.eval()
 
@@ -206,20 +187,6 @@ def load_deepsdf(dir):
 # The following functions are examples used in the DualMesh-UDF code.
 # They are similar to the ones above, but they return the results in sligthly different formats.
 # Implement your own functions for your UDFs.
-# def udf_f_dmudf(query_points, mesh):
-#     return np.sqrt(igl.point_mesh_squared_distance(query_points, mesh.vertices, mesh.faces)[0]).reshape(-1,1)
-
-# def udf_grad_f_dmudf(query_points, mesh):
-#     udf, facet_indices, closest_points = igl.point_mesh_squared_distance(query_points, mesh.vertices, mesh.faces)
-#     udf = np.sqrt(udf)
-
-#     udf_grads = query_points - closest_points
-#     udf_grads = torch.Tensor(udf_grads)
-#     # udf_grads_normalized = udf_grads / torch.linalg.norm(udf_grads, axis=1).reshape(-1,1)
-#     udf_grads_normalized = utils.normalize(udf_grads, dim=1).reshape(-1,1)
-#     return udf.reshape(-1,1), udf_grads_normalized.reshape(-1,3,1)
-
-# Here is also an example of the above functions, but for neural UDFs.
 def udf_f_deepsdf_dmudf(net, latent_vec, pts):
     net.eval()
     with torch.no_grad():
