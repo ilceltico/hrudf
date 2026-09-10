@@ -20,6 +20,7 @@ Trimesh
 Cython
 Libigl
 Setuptools
+Tqdm
 ```
 
 Alternatively, you can find my Conda environment for macOS in [requirements_macos_conda.txt](requirements_macos_conda.txt), and my Pip package list for CUDA in [requirements_cuda_pip.txt](requirements_cuda_pip.txt).  
